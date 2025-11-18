@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         论坛自动刷帖（最终稳定版-修复冲突）
 // @namespace    http://tampermonkey.net/
-// @version      0.9.1
-// @description  修复脚本冲突 | 避免已读 | 可选预览窗口 | UI自定义配置 | 配置与位置记忆 | 精准拖动
-// @author       levi & ChatGPT
+// @version      0.9.2
+// @description  修复脚本冲突 | 避免已读 | 可选预览窗口 | UI自定义配置 | 配置与位置记忆 | 精准拖动 | 修复自动停止和自动开始问题
+// @author       levi & ChatGPT & AI-Refactor
 // @match        https://www.nodeloc.com/*
 // @match        https://meta.discourse.org/*
 // @grant        GM_setValue
@@ -20,9 +20,11 @@
 
   /** ========== 配置 & 状态 ========== **/
   const MAX_HISTORY_SIZE = 1000; // 最大已读历史记录数
+
+  // [AI-MODIFIED] 将默认运行时间和帖子数改为一个极大值，实现“无限”运行
   const defaultConfig = {
     scrollInterval: 1200, scrollStep: 800, scrollDuration: 30,
-    maxTopics: 100, maxRunMins: 30, showPreview: true,
+    maxTopics: 999999, maxRunMins: 999999, showPreview: true,
   };
   let cfg = { ...defaultConfig, ...GM_getValue('linuxdoConfig', {}) };
   let visitedTopics = GM_getValue('linuxdoVisitedTopics', []);
@@ -32,10 +34,10 @@
   const randomWait = (min = 2000, max = 5000) => wait(Math.random() * (max - min) + min);
   const shuffle = arr => arr.sort(() => Math.random() - 0.5);
 
+  // [AI-MODIFIED] 使用页面临时变量控制运行状态，防止刷新后自动运行
+  let isEnabled = false;
   let isPaused = false;
   const session = { start: Date.now(), views: 0 };
-  const getEnabled = () => GM_getValue('linuxdoEnabled', false);
-  const setEnabled = v => GM_setValue('linuxdoEnabled', v);
 
   let uiState = {
     x: window.innerWidth - 240, y: window.innerHeight - 400,
@@ -139,19 +141,22 @@
     els.showPreview.onchange = () => { cfg.showPreview = els.showPreview.checked; saveConfig(); };
     els.clearHistory.onclick = () => { visitedTopics = []; saveVisitedTopics(); log('info', '已读历史已清空！'); alert('已读历史已清空！'); };
 
-    els.pause.onclick = () => { if (getEnabled()) { isPaused = !isPaused; log('info', `助手已${isPaused ? '暂停' : '恢复'}`); } };
+    els.pause.onclick = () => { if (isEnabled) { isPaused = !isPaused; log('info', `助手已${isPaused ? '暂停' : '恢复'}`); } };
     els.start.onclick = async () => {
-      if (getEnabled()) { setEnabled(false); log('info', '助手已手动停止'); }
-      else {
+      if (isEnabled) {
+        isEnabled = false;
+        log('info', '助手已手动停止');
+      } else {
         isPaused = false; session.start = Date.now(); session.views = 0;
         cfg.maxRunMins = parseInt(els.maxMins.value); cfg.maxTopics = parseInt(els.maxTopics.value); cfg.showPreview = els.showPreview.checked;
-        setEnabled(true); log('info', '助手已启动，配置：', cfg);
+        isEnabled = true;
+        log('info', '助手已启动，配置：', cfg);
         runMain();
       }
     };
 
     setInterval(() => {
-      const running = getEnabled();
+      const running = isEnabled; // [AI-MODIFIED] Use local variable
       const st = running ? (isPaused ? '暂停中' : '运行中') : (session.views > 0 ? '已完成' : '停止');
       const clr = running ? (isPaused ? 'var(--ld-warning)' : 'var(--ld-success)') : 'var(--ld-danger)';
       els.s.textContent = st; els.s.style.color = clr;
@@ -165,17 +170,15 @@
   /** ========== 核心功能 ========== **/
   async function browseTopic(topic) {
     while (isPaused) await wait(1000);
-    if (!getEnabled()) return;
+    if (!isEnabled) return; // [AI-MODIFIED] Use local variable
 
     log('info', `正在浏览: ${topic.title}`);
     const iframe = document.body.appendChild(document.createElement('iframe'));
 
-    // ==================== FIX START: 启用沙盒模式并修复预览窗口显示 ====================
-    iframe.sandbox = 'allow-scripts allow-same-origin'; // 阻止其他脚本注入，解决冲突
+    iframe.sandbox = 'allow-scripts allow-same-origin';
     const visibleStyle = `position: fixed; top: 70px; left: 8px; width: 320px; height: 480px; z-index: 99998; border: 1px solid #ccc; border-radius: 8px; box-shadow: 0 0 8px rgba(0,0,0,0.2); background: white;`;
     const hiddenStyle = `position:fixed; top:-9999px; left:-9999px; opacity:0;`;
     iframe.style.cssText = cfg.showPreview ? visibleStyle : hiddenStyle;
-    // ===================== FIX END =====================
 
     iframe.src = `${topic.url}?_=${Date.now()}`;
 
@@ -190,7 +193,7 @@
       }
 
       const endTime = Date.now() + cfg.scrollDuration * 1000;
-      while (Date.now() < endTime && getEnabled()) {
+      while (Date.now() < endTime && isEnabled) { // [AI-MODIFIED] Use local variable
         if (isPaused) { await wait(1000); continue; }
         if (iframe.contentWindow) iframe.contentWindow.scrollBy(0, cfg.scrollStep);
         await wait(cfg.scrollInterval);
@@ -200,9 +203,18 @@
   }
 
   const shouldStop = () => {
-    if (!getEnabled()) { log('info', '任务已停止。'); return true; }
-    if (session.views >= cfg.maxTopics) { log('info', `已达到最大浏览数 (${cfg.maxTopics})。`); return true; }
-    if ((Date.now() - session.start) / 60000 >= cfg.maxRunMins) { log('info', `已达到最大运行时长 (${cfg.maxRunMins}分钟)。`); return true; }
+    if (!isEnabled) { // [AI-MODIFIED] Use local variable
+      log('info', '任务已停止。');
+      return true;
+    }
+    if (session.views >= cfg.maxTopics) {
+      log('info', `已达到最大浏览数 (${cfg.maxTopics})。`);
+      return true;
+    }
+    if ((Date.now() - session.start) / 60000 >= cfg.maxRunMins) {
+      log('info', `已达到最大运行时长 (${cfg.maxRunMins}分钟)。`);
+      return true;
+    }
     return false;
   };
 
@@ -223,7 +235,10 @@
       await browseTopic(topic);
     }
 
-    if (getEnabled()) { log('info', '任务完成。'); setEnabled(false); }
+    if (isEnabled) { // [AI-MODIFIED] Use local variable
+      log('info', '任务完成。');
+      isEnabled = false; // [AI-MODIFIED] Use local variable
+    }
   }
 
   /** ========== 启动入口 ========== **/
